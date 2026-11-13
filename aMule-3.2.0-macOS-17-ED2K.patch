@@ -1,0 +1,151 @@
+--- a/src/DownloadQueue.cpp
++++ b/src/DownloadQueue.cpp
+@@ -24,6 +24,8 @@
+ //
+ 
+ #include "DownloadQueue.h" // Interface declarations
++#include "PreloadedED2KLinks.h" // One-time startup downloads
++#include <wx/file.h> // Needed for persistent startup marker
+ #include "DiskSpaceResumeBudget.h"
+ 
+ #include <protocol/Protocols.h>
+@@ -434,6 +436,55 @@
+ #define NORMALITY_FACTOR 2 // <50%
+ // x > NORMALITY_FACTOR -> High availability.
+ 
++// Adds the build owner's startup links once per *profile*, after the download queue
++// is initialized. This is intentionally independent of the GUI, so amuled works.
++// A marker is written only if every link was accepted OR already exists by hash.
++// Failed attempts retry on the next program launch, not every one-second tick.
++static void QueuePreloadedED2KOnce(CDownloadQueue *queue)
++{
++    const wxString markerPath = thePrefs::GetConfigDir() + wxT("preloaded_ed2k_v1.done");
++    if (wxFileExists(markerPath)) {
++        return;
++    }
++
++    unsigned failures = 0;
++    for (unsigned i = 0; i < PreloadedED2K::kLinkCount; ++i) {
++        const wxString uri = wxString::FromUTF8(PreloadedED2K::kLinks[i]);
++        bool alreadyAvailable = false;
++        try {
++            CScopedPtr<CED2KLink> parsed(CED2KLink::CreateLinkFromUrl(uri));
++            if (parsed.get()->GetKind() != CED2KLink::kFile) {
++                ++failures;
++                continue;
++            }
++            const CED2KFileLink *file = static_cast<const CED2KFileLink *>(parsed.get());
++            alreadyAvailable = queue->IsFileExisting(file->GetHashKey(), file->GetName());
++        } catch (const wxString &err) {
++            AddLogLineC(CFormat(wxT("Invalid preloaded eD2k link: %s")) % err);
++            ++failures;
++            continue;
++        }
++
++        if (!alreadyAvailable && !queue->AddLink(uri)) {
++            ++failures;
++        }
++    }
++
++    if (failures != 0) {
++        AddLogLineC(CFormat(wxT("Preloaded eD2k links: %u failed; will retry on next launch.")) % failures);
++        return;
++    }
++
++    wxFile marker;
++    if (!marker.Create(markerPath, false)) {
++        AddLogLineC(wxT("Cannot write preloaded ED2K marker; next launch may retry."));
++        return;
++    }
++    marker.Write(wxT("Initial links processed by this build. Delete this file to add them again.\n"));
++    marker.Close();
++    AddLogLineC(CFormat(wxT("Preloaded eD2k links processed: %u.")) % PreloadedED2K::kLinkCount);
++}
++
+ void CDownloadQueue::Process()
+ {
+ 	ProcessLocalRequests();
+@@ -586,6 +637,12 @@
+ 	// Check for new links once per second.
+ 	if ((curTick - m_nLastED2KLinkCheck) >= 1000) {
+ 		theApp->AddLinksFromFile();
++		// First tick only: process embedded startup links, then rely on the marker.
++		static bool preloadedCheckedThisProcess = false;
++		if (!preloadedCheckedThisProcess) {
++			preloadedCheckedThisProcess = true;
++			QueuePreloadedED2KOnce(this);
++		}
+ 		m_nLastED2KLinkCheck = curTick;
+ 	}
+ }
+--- a/src/Preferences.cpp
++++ b/src/Preferences.cpp
+@@ -1087,6 +1087,22 @@
+ 
+ #ifndef CLIENT_GUI
+ 	LoadPreferences();
++	// Give this custom build its requested nickname once per profile. Existing profiles
++	// receive it on their first launch of this build too; subsequent edits from
++	// Preferences or the remote API are honoured and kept across restarts.
++	wxConfigBase *nickCfg = wxConfigBase::Get();
++	bool initialNickApplied = false;
++	if (nickCfg) {
++		nickCfg->Read("/eMule/LargeLibraryV03InitialNickApplied", &initialNickApplied, false);
++	}
++	if (nickCfg && !initialNickApplied) {
++		s_nick = wxT("KEEP SHARING THIS FILE--------------->");
++		nickCfg->Write("/eMule/Nick", s_nick);
++		nickCfg->Write("/eMule/LargeLibraryV03InitialNickApplied", true);
++		if (!nickCfg->Flush()) {
++			AddLogLineC(wxT("Unable to save the initial nickname for this profile."));
++		}
++	}
+ 	// Not ReloadSharedFolders(): expanding recursive roots walks their whole trees before
+ 	// anything is on screen, and the startup scan does it again anyway.
+ 	LoadSavedSharedFolders();
+@@ -1111,7 +1127,8 @@
+ #endif /* AMULE_DAEMON */
+ 
+ 	/** User settings */
+-	NewCfgItem(IDC_NICK, (new Cfg_Str("/eMule/Nick", s_nick, "https://amule-org.github.io")));
++	// Default only: existing amule.conf values and later user edits take precedence.
++	NewCfgItem(IDC_NICK, (new Cfg_Str("/eMule/Nick", s_nick, "KEEP SHARING THIS FILE--------------->")));
+ #ifndef AMULE_DAEMON
+ 	NewCfgItem(IDC_LANGUAGE, (new Cfg_Lang()));
+ #endif
+--- /dev/null
++++ b/src/PreloadedED2KLinks.h
+@@ -0,0 +1,33 @@
++// Startup ED2K downloads embedded by the Large Library Mod.
++// These URLs were supplied by the build owner. They are attempted once per
++// configuration profile, not re-enqueued after the marker has been written.
++// Keep every URI exactly as hashed; changing the filename does not change
++// its content hash, but retaining names avoids confusing users.
++#ifndef AMULE_PRELOADED_ED2K_LINKS_H
++#define AMULE_PRELOADED_ED2K_LINKS_H
++
++namespace PreloadedED2K
++{
++static const char *const kLinks[] = {
++    "ed2k://|file|!!!#$EMULE%20AMULE%20BOOKS,%20LIVRES,%20LIBRI%20LIBROS%20B%C3%9CCHER%20%D0%9A%D0%9D%D0%98%D0%93%D0%98%20.txt|1795|F2DDE54B2698154B72745520CE714507|h=OSS2X3M427DPGGFORBRY3Y32PUIBYDUY|/",
++    "ed2k://|file|COLE%C3%87%C3%83O%20DE%20LIVROS%20mirror.url|72|287E788C026A70C87D8110CC5A910B64|h=Y3KUA65ASNSHWGS7TUBP3HOI37ANNPYG|/",
++    "ed2k://|file|COLE%C3%87%C3%83O%20DE%20LIVROS.url|69|92D65987899BB7BAE62820E398DF72D6|h=UI5XA2OQI3CYR5CT7IHOWWJABOEOHXIE|/",
++    "ed2k://|file|EMULE%20BOOKS%20COLLECTIONS%20mirror.url|56|A93922F0CA76B56FD80B060D4DAC1462|h=65H3EREAJM6HDHMQUH77JQLZB5OZKNN2|/",
++    "ed2k://|file|EMULE%20BOOKS%20COLLECTIONS.url|57|138C1F656D2BF36203900F8F206F97EA|h=QHFGX23P5ECBWTSH3TCV2A4VJGE5RBHY|/",
++    "ed2k://|file|EMULE%20B%C3%9CCHERSAMMLUNG%20mirror.url|71|560B6F960734A7953C72563308FE0FB1|h=YKA7N2P4HE24VHCGHU4JWCTXAZAMVKYD|/",
++    "ed2k://|file|EMULE%20B%C3%9CCHERSAMMLUNG.url|70|B38803D46D46CE1BCFE0785ADDAF6D41|h=SGH5J2MDVUOAXEJBH5LJYXAINTYFZCK3|/",
++    "ed2k://|file|EMULE%20COLECCIONES%20DE%20LIBROS.url|70|5E3BFBBA40EA8D08E62CB396720DD39A|h=ZYBGURNDVCGQPO6YCHSOAIV4PVGRGGWJ|/",
++    "ed2k://|file|EMULE%20COLLEZIONE%20DI%20LIBRI%20mirror.url|71|36C65399BF2B4B85EFF590EBDA27AB1F|h=ZUUW366WPDJLCGIGKB5UHU6HK5ARLMSG|/",
++    "ed2k://|file|EMULE%20COLLEZIONE%20DI%20LIBRI.url|70|33F776C6F48B3706B0AB17F78275CB6D|h=KX4ETT5GW7MHQFJHVPPMADJEXSJUJF3Z|/",
++    "ed2k://|file|EMULE%20LIBROS%20COLLECTIONES%20mirror.url|71|085D54CC29D747488B4742F366565814|h=LDXSL65ILUB2BDNYE3TXHHAOB35UIPXP|/",
++    "ed2k://|file|EMULE%20LIVRES%20COLLECTIONS%20mirror.url|71|95BE6557DF27BC805BFA82381F4ABC90|h=AC4I6XO2CR4KSBPO3TT4SA27DX7UXBTD|/",
++    "ed2k://|file|EMULE%20LIVRES%20COLLECTIONS.url|71|7A7B349B67209EC3BBA24D6A5D11FB42|h=ZZNTAYMIC5SM3UE5MAVRYWXKBXGE4IX3|/",
++    "ed2k://|file|TUTTO%20IN%20ITALIANO%20mirror.url|89|ED8EA8E2FE630A99B7C2A09672A9077D|h=ROTNQCU4UJWVDIXFZ3P7MCDI32NJ4VHR|/",
++    "ed2k://|file|TUTTO%20IN%20ITALIANO.url|91|BD4591A81E0AE78B73252CEAEBAA9B3B|h=6QQLLVKCS4XEL3YBURVPLBUANIKWH24D|/",
++    "ed2k://|file|%D0%9A%D0%9E%D0%9B%D0%9B%D0%95%D0%9A%D0%A6%D0%98%D0%AF%20%D0%9A%D0%9D%D0%98%D0%93%20mirror.url|71|67C4108F94400DA7EF56A6FBE2549845|h=G5HHEUD6ZIDEJJOOJRSCOF4NWXL5I6NF|/",
++    "ed2k://|file|%D0%9A%D0%9E%D0%9B%D0%9B%D0%95%D0%9A%D0%A6%D0%98%D0%AF%20%D0%9A%D0%9D%D0%98%D0%93.url|91|3941B3589D45D03A780328C508BB131B|h=ZS4OAWNOMY2CLJSV2HKEHAPXGT7IOZYZ|/",
++};
++static const unsigned kLinkCount = sizeof(kLinks) / sizeof(kLinks[0]);
++} // namespace PreloadedED2K
++
++#endif // AMULE_PRELOADED_ED2K_LINKS_H
