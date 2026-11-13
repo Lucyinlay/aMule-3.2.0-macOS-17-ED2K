@@ -1,0 +1,77 @@
+name: Compilar aMule 3.2.0 macOS (17 enlaces ED2K)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compilar:
+    name: macOS ${{ matrix.arquitectura }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arquitectura: Apple-Silicon-arm64
+          - runner: macos-15-intel
+            arquitectura: Intel-x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - name: Obtener el parche desde este repositorio
+        uses: actions/checkout@v4
+
+      - name: Comprobar herramientas y arquitectura
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          xcode-select -p
+          brew --version
+          test -s aMule-3.2.0-macOS-17-ED2K.patch
+
+      - name: Instalar dependencias macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake boost cryptopp gd gettext libmaxminddb libupnp pkg-config wxwidgets dylibbundler
+
+      - name: Descargar código oficial aMule 3.2.0 y aplicar parche
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 3.2.0 https://github.com/amule-org/amule.git codigo-amule
+          cd codigo-amule
+          git apply --check ../aMule-3.2.0-macOS-17-ED2K.patch
+          git apply ../aMule-3.2.0-macOS-17-ED2K.patch
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+          content = Path('src/PreloadedED2KLinks.h').read_text(encoding='utf-8')
+          links = re.findall(r'"(ed2k://\|file\|[^"\n]+)"', content)
+          hashes = [x.split('|')[5] for x in links]
+          assert len(links) == 17, f'Se esperaban 17 enlaces; hay {len(links)}'
+          assert len(set(hashes)) == 17, 'Existen hashes ED2K repetidos'
+          assert 'KEEP SHARING THIS FILE--------------->' in Path('src/Preferences.cpp').read_text(encoding='utf-8')
+          print('OK: 17 enlaces ED2K diferentes y nickname incrustado.')
+          PYCODE
+
+      - name: Compilar y generar DMG macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd codigo-amule
+          bash packaging/macos/build.sh
+          find dist -type f -name '*.dmg' -print
+          find dist -type f -name '*.dmg' | grep -q .
+
+      - name: Guardar DMG para descargar desde GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: aMule-3.2.0-macOS-${{ matrix.arquitectura }}-17-ED2K
+          path: codigo-amule/dist/*.dmg
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
